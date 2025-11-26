@@ -18,5 +18,12 @@ class CandidateOut(BaseModel):
     total_oi: Optional[float] = None
     total_volume: Optional[float] = None
 
+    direction: Optional[str] = None
+    strategy_hint: Optional[str] = None
+
+    ai_direction: Optional[str] = None
+    ai_strategy_hint: Optional[str] = None
+    ai_explanation: Optional[str] = None
+
     class Config:
         from_attributes = True

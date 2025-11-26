@@ -48,6 +48,8 @@ def list_candidates(
                 expiry=r.get("expiry"),
                 total_oi=r.get("total_oi"),
                 total_volume=r.get("total_volume"),
+                direction=r.get("direction"),
+                strategy_hint=r.get("strategy_hint"),
             )
         )
 

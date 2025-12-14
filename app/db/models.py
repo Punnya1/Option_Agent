@@ -11,10 +11,18 @@ from sqlalchemy import (
     UniqueConstraint,
     Index,
 )
+from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 
 from app.db.sessions import Base
 
+class ProcessedRun(Base):
+    __tablename__ = "processed_runs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_date = Column(Date, nullable=False, unique=True)  # trading date that was ingested
+    source = Column(String, nullable=False)  # e.g., "equity", "fno", "both"
+    created_at = Column(Date, server_default=func.now())
 
 class Stock(Base):
     __tablename__ = "stocks"

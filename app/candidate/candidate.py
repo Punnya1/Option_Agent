@@ -7,11 +7,13 @@ from sqlalchemy.orm import Session
 from app.candidate.candidate_access import get_top_candidates_for_date
 from app.candidate.candidate_validator import CandidateOut
 from app.db.sessions import get_db
+from app.core.logging_utils import get_logger
 
 router = APIRouter(
     prefix="/candidates",
     tags=["candidates"],
 )
+logger = get_logger(__name__)
 
 
 @router.get("/", response_model=List[CandidateOut])
@@ -29,17 +31,31 @@ def list_candidates(
     Example:
     GET /candidates?date=2025-11-21&limit=20&min_oi=10000&min_volume=100
     """
-    raw_results = get_top_candidates_for_date(
-        db, target_date, limit=limit, min_oi=min_oi, min_volume=min_volume
+
+    logger.info(
+        f"Fetching candidates for date={target_date}, limit={limit}, "
+        f"min_oi={min_oi}, min_volume={min_volume}"
     )
+
+    try:
+        raw_results = get_top_candidates_for_date(
+            db, target_date, limit=limit, min_oi=min_oi, min_volume=min_volume
+        )
+    except Exception as e:
+        logger.exception(f"Error fetching candidates for date={target_date}: {e}")
+        raise
+
+    logger.info(f"Fetched {len(raw_results)} raw candidates for {target_date}")
 
     candidates: List[CandidateOut] = []
     for r in raw_results:
+        logger.debug(f"Parsing candidate symbol={r.get('symbol')}")
+
         candidates.append(
             CandidateOut(
-                symbol=r["symbol"],
-                date=r["date"],
-                score=r["score"],
+                symbol=r.get("symbol"),
+                date=r.get("date"),
+                score=r.get("score"),
                 atr_pct=r.get("atr_pct", 0.0),
                 vol_spike=r.get("vol_spike", 0.0),
                 gap_pct=r.get("gap_pct", 0.0),
@@ -53,4 +69,5 @@ def list_candidates(
             )
         )
 
+    logger.info(f"Returning {len(candidates)} candidates for {target_date}")
     return candidates

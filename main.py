@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 
 from app.candidate import candidate
+from app.news import news
 from app.stock import stocks
 from app.ai import ai_router
 
@@ -13,3 +14,4 @@ async def health():
 app.include_router(stocks.router)
 app.include_router(candidate.router)
 app.include_router(ai_router.router)
+app.include_router(news.router)

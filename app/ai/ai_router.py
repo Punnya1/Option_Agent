@@ -1,5 +1,3 @@
-# app/ai/ai_router.py
-
 from datetime import date
 from typing import List
 
@@ -9,13 +7,15 @@ from sqlalchemy.orm import Session
 from app.candidate.candidate_access import get_top_candidates_for_date
 from app.candidate.candidate_validator import CandidateOut
 from app.db.sessions import get_db
-
+from app.ai.ai_access import get_event_candidates
+from app.core.logging_utils import get_logger
 from .ai_explainer import get_ai_annotation_for_candidate
 
 router = APIRouter(
     prefix="/candidates",
     tags=["candidates-ai"],
 )
+logger = get_logger(__name__)
 
 
 @router.get("/ai", response_model=List[CandidateOut])
@@ -70,3 +70,15 @@ def list_candidates_with_ai(
         )
 
     return result
+
+
+@router.get("/candidates")
+def event_candidates(
+    window_days: int = Query(7, ge=1, le=30),
+    db: Session = Depends(get_db),
+):
+    """
+    Event-driven stock ideas based on BSE corporate announcements.
+    """
+    logger.info("Fetching event candidates window_days=%d", window_days)
+    return get_event_candidates(db, window_days)

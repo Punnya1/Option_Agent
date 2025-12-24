@@ -71,7 +71,7 @@ Guidelines:
 # 3) LLM client (Groq)
 logger.info("Initializing Groq LLM client for AI explainer...")
 llm = ChatGroq(
-    model_name="llama-3.3-70b-versatile",  # or "llama-3.1-8b-instant" if you prefer cheaper/faster
+    model="llama-3.3-70b-versatile",  # Changed from model_name to model for langchain-core 1.x
     temperature=0.2,                        # small randomness
     groq_api_key=settings.groq_api_key,
 )

@@ -4,7 +4,17 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.db.sessions import engine, Base
-from app.db.models import Stock
+# Import all models so SQLAlchemy knows about them when creating tables
+from app.db.models import (
+    Stock,
+    DailyPrice,
+    OptionChain,
+    News,
+    NewsImpact,
+    DailyCandidate,
+    BSEEvent,
+    ProcessedRun,
+)
 from app.services.universe import get_fno_universe
 
 

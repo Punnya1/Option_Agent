@@ -4,6 +4,7 @@ from app.candidate import candidate
 from app.news import news
 from app.stock import stocks
 from app.ai import ai_router
+from app.announcements import announcements
 
 app = FastAPI()
 
@@ -15,3 +16,4 @@ app.include_router(stocks.router)
 app.include_router(candidate.router)
 app.include_router(ai_router.router)
 app.include_router(news.router)
+app.include_router(announcements.router)

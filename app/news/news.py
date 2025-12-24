@@ -44,7 +44,7 @@ parser = JsonOutputParser(pydantic_object=AIResponseSchema)
 
 # LLM client
 llm = ChatGroq(
-    model_name="llama-3.1-8b-instant", 
+    model="llama-3.1-8b-instant", 
     temperature=0.15,
     groq_api_key=settings.groq_api_key,
 )

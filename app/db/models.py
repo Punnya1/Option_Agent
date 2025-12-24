@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     UniqueConstraint,
     Index,
+    Text
 )
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -144,3 +145,18 @@ class DailyCandidate(Base):
         UniqueConstraint("symbol", "date", name="uq_daily_candidates_symbol_date"),
         Index("ix_daily_candidates_date_score", "date", "score"),
     )
+
+class BSEEvent(Base):
+    __tablename__ = "bse_events"
+
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String, index=True)
+    scrip_code = Column(String, index=True)
+    category = Column(String)
+    headline = Column(Text)
+    event_date = Column(Date)
+    published_at = Column(DateTime)
+    source = Column(String, default="BSE")
+    url = Column(Text)
+    content_hash = Column(String, unique=True, index=True)
+    created_at = Column(DateTime, server_default=func.now())

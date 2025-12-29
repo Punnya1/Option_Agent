@@ -10,8 +10,13 @@ from sqlalchemy.orm import Session
 
 from app.core.logging_utils import get_logger
 from app.services.bse_scraper import ingest_bse_announcements
-from app.services.announcement_classifier import filter_high_volatility_announcements
+from app.services.announcement_classifier import (
+    filter_high_volatility_announcements,
+    deduplicate_announcements_by_symbol,
+    deduplicate_announcements_by_symbol_pre_classification,
+)
 from app.services.stock_researcher import research_multiple_stocks
+from app.services.universe import get_fno_symbols
 from app.db.models import BSEEvent
 
 logger = get_logger(__name__)
@@ -64,9 +69,30 @@ def scrape_announcements(state: WorkflowState, db: Session) -> WorkflowState:
         
         logger.info(f"Found {len(announcements)} announcements")
         
+        # Filter to only FNO universe stocks BEFORE classification to avoid wasting LLM calls
+        fno_symbols = set(s.upper() for s in get_fno_symbols())
+        fno_announcements = []
+        skipped_symbols = set()
+        
+        for ann in announcements:
+            symbol = ann.get("symbol")
+            if symbol and symbol.upper() in fno_symbols:
+                fno_announcements.append(ann)
+            elif symbol:
+                skipped_symbols.add(symbol.upper())
+        
+        if skipped_symbols:
+            logger.info(
+                f"Filtered out {len(announcements) - len(fno_announcements)} announcements "
+                f"for {len(skipped_symbols)} stocks not in FNO universe "
+                f"(examples: {', '.join(list(skipped_symbols)[:5])})"
+            )
+        
+        logger.info(f"Proceeding with {len(fno_announcements)} announcements from FNO universe stocks")
+        
         return {
             **state,
-            "announcements": announcements,
+            "announcements": fno_announcements,
             "step": "scraped",
         }
         
@@ -94,15 +120,22 @@ def classify_announcements(state: WorkflowState, max_classifications: int = 20) 
         }
     
     try:
+        # Deduplicate BEFORE classification to avoid wasting LLM calls on duplicates
+        # Pick one announcement per symbol (preferring results/orders)
+        deduplicated = deduplicate_announcements_by_symbol_pre_classification(announcements)
+        
         # Filter for high volatility announcements
         # Limit classifications to avoid hitting Groq rate limits
         high_vol = filter_high_volatility_announcements(
-            announcements=announcements,
+            announcements=deduplicated,
             min_confidence="medium",
             max_classifications=max_classifications
         )
         
-        logger.info(f"Found {len(high_vol)} high-volatility announcements")
+        # Final deduplication after classification (in case classification changes priorities)
+        high_vol = deduplicate_announcements_by_symbol(high_vol)
+        
+        logger.info(f"Found {len(high_vol)} high-volatility announcements (after deduplication)")
         
         return {
             **state,

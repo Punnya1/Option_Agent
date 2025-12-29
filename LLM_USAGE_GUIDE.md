@@ -19,11 +19,13 @@
 ### LLM Call Count:
 
 **Per Pipeline Run:**
+
 - **Maximum**: 20 LLM calls (default limit)
 - **Typical**: 5-15 calls (after filtering low-confidence/neutral announcements)
 - **Location**: `app/services/announcement_classifier.py::filter_high_volatility_announcements()`
 
 **Why 20?**
+
 - Groq free tier: ~30 requests/minute
 - Groq paid tier: Higher limits
 - Default limit of 20 ensures we stay under rate limits
@@ -31,6 +33,7 @@
 ### Adjusting LLM Call Limits:
 
 **Option 1: Change Default Limit**
+
 ```python
 # In app/services/announcement_workflow.py
 high_vol = filter_high_volatility_announcements(
@@ -41,6 +44,7 @@ high_vol = filter_high_volatility_announcements(
 ```
 
 **Option 2: Use API Parameter**
+
 ```python
 # Add to API endpoint
 @router.post("/announcements/run-pipeline")
@@ -51,13 +55,14 @@ def run_pipeline(
 ):
     # Pass to workflow
     result = run_daily_announcement_pipeline(
-        db=db, 
+        db=db,
         target_date=target_date,
         max_classifications=max_llm_calls
     )
 ```
 
 **Option 3: Pre-filter Before LLM**
+
 ```python
 # Add keyword-based pre-filtering to reduce LLM calls
 def pre_filter_announcements(announcements):
@@ -74,15 +79,18 @@ def pre_filter_announcements(announcements):
 ## Groq Rate Limits
 
 ### Free Tier:
+
 - **Rate Limit**: ~30 requests/minute
 - **Daily Limit**: Varies
 - **Model**: llama-3.1-8b-instant (faster, cheaper)
 
 ### Paid Tier:
+
 - **Rate Limit**: Higher (check Groq dashboard)
 - **Model**: llama-3.3-70b-versatile (better quality)
 
 ### Current Configuration:
+
 - **Model**: `llama-3.3-70b-versatile` (in `announcement_classifier.py`)
 - **Temperature**: 0.2 (low randomness)
 - **Max Calls**: 20 per pipeline run
@@ -90,6 +98,7 @@ def pre_filter_announcements(announcements):
 ## Optimizations to Reduce LLM Calls
 
 ### 1. **Keyword Pre-filtering** (Recommended)
+
 Filter announcements by keywords before LLM classification:
 
 ```python
@@ -97,12 +106,13 @@ def pre_filter_by_keywords(announcements):
     """Filter to only high-impact announcements."""
     keywords = ["result", "quarter", "order", "contract", "merger", "fund"]
     return [
-        a for a in announcements 
+        a for a in announcements
         if any(kw in a.get("headline", "").lower() for kw in keywords)
     ]
 ```
 
 ### 2. **Caching Classifications**
+
 Cache LLM results for similar announcements:
 
 ```python
@@ -118,13 +128,16 @@ def cached_classify(headline_hash, symbol, category):
 ```
 
 ### 3. **Batch Classification** (Future)
+
 If Groq supports batch API:
+
 ```python
 # Classify multiple announcements in one call
 classifications = classify_announcements_batch(announcements[:20])
 ```
 
 ### 4. **Use Faster Model for Initial Filter**
+
 ```python
 # Use faster model for initial classification
 # Then use better model only for high-confidence ones
@@ -136,6 +149,7 @@ if initial_confidence == "high":
 ## Monitoring LLM Usage
 
 ### Add Usage Tracking:
+
 ```python
 # Track LLM calls
 llm_call_count = 0
@@ -148,12 +162,14 @@ def classify_announcement(...):
 ```
 
 ### Check Groq Dashboard:
+
 - Monitor usage at: https://console.groq.com/
 - Set up alerts for rate limit warnings
 
 ## Expected Response for Stock Research
 
 ### Normal Response (with technical data):
+
 ```json
 {
   "symbol": "RELIANCE",
@@ -173,6 +189,7 @@ def classify_announcement(...):
 ```
 
 ### Expected Response (no technical data):
+
 ```json
 {
   "symbol": "RELIANCE",
@@ -192,6 +209,7 @@ def classify_announcement(...):
 ```
 
 **This is expected when:**
+
 - Date is in the future (announcement today, trade tomorrow)
 - No price data exists for that date yet
 - Stock is not in F&O universe
@@ -223,4 +241,3 @@ research_results = research_multiple_stocks(db, high_vol)
 ```
 
 This reduces LLM calls from 50 to 15 (70% reduction)!
-

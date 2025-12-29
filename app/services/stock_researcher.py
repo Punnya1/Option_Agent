@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.logging_utils import get_logger
 from app.services.signals import score_symbol_for_date, get_price_history
 from app.services.options import get_options_liquidity
+from app.services.universe import get_fno_symbols
 from app.candidate.candidate_access import classify_direction_and_strategy
 
 logger = get_logger(__name__)
@@ -36,26 +37,77 @@ def research_stock_with_announcement(
         - Technical metrics (OI, volume, price action)
         - Trading recommendation
     """
-    logger.info(f"Researching {symbol} for announcement on {announcement_date}")
+    symbol_upper = symbol.upper()
+    logger.info(f"Researching {symbol_upper} for announcement on {announcement_date}")
+    
+    # Check if stock is in FNO universe
+    fno_symbols = get_fno_symbols()
+    if symbol_upper not in fno_symbols:
+        logger.warning(
+            f"{symbol_upper} is not in FNO universe - skipping technical research. "
+            f"Announcement may still be valid but options trading not available."
+        )
+        return {
+            "symbol": symbol_upper,
+            "announcement_date": announcement_date,
+            "announcement": {
+                "headline": classification.get("headline", ""),
+                "event_type": classification.get("event_type"),
+                "direction": classification.get("ai_direction"),
+                "reaction_window": classification.get("reaction_window"),
+                "confidence": classification.get("confidence"),
+                "explanation": classification.get("explanation", ""),
+            },
+            "technicals": {
+                "direction": "unknown",
+                "strategy_hint": "Stock not in FNO universe",
+                "daily_return": None,
+                "vol_spike": None,
+                "atr_pct": None,
+                "gap_pct": None,
+                "spot_price": None,
+            },
+            "options_liquidity": {
+                "total_oi": 0,
+                "total_volume": 0,
+                "expiry": None,
+            },
+            "final_recommendation": {
+                "direction": classification.get("ai_direction", "neutral"),
+                "confidence_score": 30,  # Lower score since no options available
+                "trade_ready": False,
+                "suggested_strategy": f"Stock not in FNO universe - cannot trade options. Announcement suggests {classification.get('ai_direction', 'neutral')} direction.",
+            },
+            "note": "Stock not in FNO universe - options trading not available",
+        }
     
     # Get technical metrics for the announcement date
-    # Try the announcement date first, then fallback to last available trading date
-    metrics = score_symbol_for_date(db, symbol, announcement_date)
+    # Try multiple dates: announcement date, then previous days (up to 5 days back)
+    metrics = None
+    used_date = None
+    from datetime import timedelta
     
-    # If no data for announcement date, try previous trading day
-    if not metrics:
-        from datetime import timedelta
-        prev_date = announcement_date - timedelta(days=1)
-        metrics = score_symbol_for_date(db, symbol, prev_date)
+    for days_back in range(6):  # Try 0 to 5 days back
+        try_date = announcement_date - timedelta(days=days_back)
+        metrics = score_symbol_for_date(db, symbol_upper, try_date)
         if metrics:
-            logger.info(f"Using previous trading day {prev_date} data for {symbol}")
+            used_date = try_date
+            if days_back > 0:
+                logger.info(f"Using data from {try_date} ({(announcement_date - try_date).days} days before announcement) for {symbol_upper}")
+            break
     
     # If still no metrics, return basic research with just announcement data
     if not metrics:
-        logger.warning(f"No technical metrics found for {symbol} on {announcement_date} or previous day")
+        logger.warning(
+            f"No technical metrics found for {symbol_upper} on {announcement_date} "
+            f"or up to 5 days before. Possible reasons: "
+            f"1. Data not ingested for this date range, "
+            f"2. Stock may not have traded recently, "
+            f"3. Date may be a non-trading day"
+        )
         # Return research with just announcement classification (no technicals)
         return {
-            "symbol": symbol,
+            "symbol": symbol_upper,
             "announcement_date": announcement_date,
             "announcement": {
                 "headline": classification.get("headline", ""),
@@ -85,17 +137,26 @@ def research_stock_with_announcement(
                 "trade_ready": False,  # Can't trade without technical data
                 "suggested_strategy": f"Wait for technical data. Announcement suggests {classification.get('ai_direction', 'neutral')} direction.",
             },
-            "note": "No technical data available - recommendation based on announcement only",
+            "note": "No technical data available - recommendation based on announcement only. Check if data is ingested for this date range.",
         }
     
-    # Get options liquidity
-    liquidity = get_options_liquidity(db, symbol, announcement_date, moneyness_band=0.1)
-    if not liquidity:
+    # Get options liquidity - try announcement date first, then used_date if different
+    liquidity = None
+    for try_date in [announcement_date, used_date] if used_date and used_date != announcement_date else [announcement_date]:
+        liquidity = get_options_liquidity(db, symbol_upper, try_date, moneyness_band=0.1)
+        if liquidity:
+            break
         # Try wider band
-        liquidity = get_options_liquidity(db, symbol, announcement_date, moneyness_band=0.2)
+        liquidity = get_options_liquidity(db, symbol_upper, try_date, moneyness_band=0.2)
+        if liquidity:
+            break
     
-    # Get price history for context
-    price_history = get_price_history(db, symbol, announcement_date, lookback_days=10)
+    # Get price history for context - use used_date if available
+    price_history = get_price_history(
+        db, symbol_upper, 
+        used_date if used_date else announcement_date, 
+        lookback_days=10
+    )
     
     # Classify direction based on technicals
     direction, strategy_hint = classify_direction_and_strategy(metrics)
@@ -146,7 +207,7 @@ def research_stock_with_announcement(
     
     # Build recommendation
     recommendation = {
-        "symbol": symbol,
+        "symbol": symbol_upper,
         "announcement_date": announcement_date,
         "announcement": {
             "headline": classification.get("headline", ""),

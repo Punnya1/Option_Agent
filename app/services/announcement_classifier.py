@@ -314,25 +314,14 @@ def filter_high_volatility_announcements(
         direction = classification.get("ai_direction", "neutral")
         event_type = classification.get("event_type", "neutral")
         
-        # Log what LLM returned for first 5 announcements (for debugging)
-        if idx < 5:
-            logger.info(
-                f"[LLM Response {idx+1}] {symbol}:\n"
-                f"  Headline: {headline[:120]}...\n"
-                f"  Direction: {direction}\n"
-                f"  Confidence: {classification.get('confidence')}\n"
-                f"  Event Type: {event_type}\n"
-                f"  Reaction Window: {classification.get('reaction_window')}\n"
-                f"  Explanation: {classification.get('explanation', '')[:200]}"
-            )
+        # ALWAYS store classification in announcement dict for logging (even if filtered out)
+        classification["headline"] = headline  # Include headline in classification
+        ann["classification"] = classification
         
         # Include if:
         # 1. Confidence meets threshold
         # 2. Direction is not neutral (bullish or bearish)
         if conf_level >= min_level and direction != "neutral":
-            # Add classification to announcement dict
-            classification["headline"] = headline  # Include headline in classification
-            ann["classification"] = classification
             high_vol_announcements.append(ann)
             logger.info(
                 f"✓ High volatility announcement: {symbol} - {headline[:50]}... "
@@ -357,6 +346,40 @@ def filter_high_volatility_announcements(
         f"{len(high_vol_announcements)} passed filter "
         f"(required: confidence>={min_confidence}, direction!=neutral)"
     )
+    
+    # Log top 15 classification results (all classified announcements, not just filtered ones)
+    # Collect all classifications (including filtered out ones) for logging
+    all_classifications = []
+    for idx, ann in enumerate(announcements_to_process):
+        symbol = ann.get("symbol", "UNKNOWN")
+        headline = ann.get("headline", "")
+        # Get classification if it was added to the announcement
+        classification = ann.get("classification")
+        if classification:
+            all_classifications.append({
+                "symbol": symbol,
+                "headline": headline,
+                "classification": classification
+            })
+    
+    # Log top 15 classification results
+    top_n = min(15, len(all_classifications))
+    if top_n > 0:
+        logger.info(f"\n{'='*80}")
+        logger.info(f"TOP {top_n} LLM CLASSIFICATION RESULTS:")
+        logger.info(f"{'='*80}")
+        for idx, item in enumerate(all_classifications[:top_n], 1):
+            cls = item["classification"]
+            logger.info(
+                f"\n[{idx}] {item['symbol']}\n"
+                f"  Headline: {item['headline'][:120]}...\n"
+                f"  Direction: {cls.get('ai_direction', 'N/A')}\n"
+                f"  Confidence: {cls.get('confidence', 'N/A')}\n"
+                f"  Event Type: {cls.get('event_type', 'N/A')}\n"
+                f"  Reaction Window: {cls.get('reaction_window', 'N/A')}\n"
+                f"  Explanation: {cls.get('explanation', 'N/A')[:200]}"
+            )
+        logger.info(f"{'='*80}\n")
     
     if len(high_vol_announcements) == 0 and total_classified > 0:
         logger.warning(

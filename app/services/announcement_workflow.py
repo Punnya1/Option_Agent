@@ -16,7 +16,6 @@ from app.services.announcement_classifier import (
     deduplicate_announcements_by_symbol_pre_classification,
 )
 from app.services.stock_researcher import research_multiple_stocks
-from app.services.universe import get_fno_symbols
 from app.db.models import BSEEvent
 
 logger = get_logger(__name__)
@@ -69,30 +68,27 @@ def scrape_announcements(state: WorkflowState, db: Session) -> WorkflowState:
         
         logger.info(f"Found {len(announcements)} announcements")
         
-        # Filter to only FNO universe stocks BEFORE classification to avoid wasting LLM calls
-        fno_symbols = set(s.upper() for s in get_fno_symbols())
-        fno_announcements = []
-        skipped_symbols = set()
+        # NOTE: We've already selected "Equity F&O" segment in the BSE scraper,
+        # so ALL announcements returned are for F&O stocks. No need to filter by FNO universe.
+        # The symbol extraction might be imperfect, but since segment is Equity F&O,
+        # all stocks have option chains by definition.
         
+        # Log unique symbols found
+        unique_symbols = set()
         for ann in announcements:
             symbol = ann.get("symbol")
-            if symbol and symbol.upper() in fno_symbols:
-                fno_announcements.append(ann)
-            elif symbol:
-                skipped_symbols.add(symbol.upper())
+            if symbol:
+                unique_symbols.add(symbol.upper())
         
-        if skipped_symbols:
-            logger.info(
-                f"Filtered out {len(announcements) - len(fno_announcements)} announcements "
-                f"for {len(skipped_symbols)} stocks not in FNO universe "
-                f"(examples: {', '.join(list(skipped_symbols)[:5])})"
-            )
-        
-        logger.info(f"Proceeding with {len(fno_announcements)} announcements from FNO universe stocks")
+        logger.info(
+            f"Proceeding with {len(announcements)} announcements from {len(unique_symbols)} stocks "
+            f"(all are Equity F&O since segment filter was applied). "
+            f"Symbols: {', '.join(sorted(list(unique_symbols))[:20])}"
+        )
         
         return {
             **state,
-            "announcements": fno_announcements,
+            "announcements": announcements,  # Use all announcements, no FNO filtering
             "step": "scraped",
         }
         
@@ -159,12 +155,24 @@ def research_stocks(state: WorkflowState, db: Session) -> WorkflowState:
     high_vol = state.get("high_vol_announcements", [])
     
     if not high_vol:
-        logger.warning("No high-volatility announcements to research")
+        logger.warning(
+            "No high-volatility announcements to research. "
+            "This could mean: 1) No announcements passed LLM classification filter, "
+            "2) All announcements were filtered out (low confidence or neutral direction), "
+            "3) No FNO stocks had high-impact announcements today."
+        )
         return {
             **state,
             "research_results": [],
             "step": "completed",
         }
+    
+    # Log which stocks will be researched
+    symbols_to_research = [ann.get("symbol", "UNKNOWN") for ann in high_vol]
+    logger.info(
+        f"Researching {len(high_vol)} stocks with high-volatility announcements: "
+        f"{', '.join(sorted(set(symbols_to_research)))}"
+    )
     
     try:
         # Research each stock
@@ -176,7 +184,32 @@ def research_stocks(state: WorkflowState, db: Session) -> WorkflowState:
             if r.get("final_recommendation", {}).get("trade_ready", False)
         ]
         
+        # Log detailed research outcomes
         logger.info(f"Researched {len(research_results)} stocks, {len(trade_ready)} are trade-ready")
+        
+        if research_results:
+            for result in research_results:
+                symbol = result.get("symbol", "UNKNOWN")
+                trade_ready_status = result.get("final_recommendation", {}).get("trade_ready", False)
+                confidence = result.get("final_recommendation", {}).get("confidence_score", 0)
+                reason = result.get("note", "No note")
+                
+                if not trade_ready_status:
+                    logger.info(
+                        f"  {symbol}: Not trade-ready (confidence: {confidence}, reason: {reason})"
+                    )
+                else:
+                    direction = result.get("final_recommendation", {}).get("direction", "unknown")
+                    logger.info(
+                        f"  {symbol}: ✓ Trade-ready (direction: {direction}, confidence: {confidence})"
+                    )
+        
+        if len(trade_ready) == 0 and len(research_results) > 0:
+            logger.warning(
+                f"Researched {len(research_results)} stocks but none are trade-ready. "
+                f"Common reasons: 1) Missing technical data, 2) Low options liquidity, "
+                f"3) Low confidence scores, 4) Data not ingested for these dates."
+            )
         
         return {
             **state,

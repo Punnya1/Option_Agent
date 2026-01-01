@@ -92,21 +92,136 @@ def _get_symbol_from_scrip_code(db: Session, scrip_code: str) -> Optional[str]:
     return None
 
 
+# High-volatility categories that drive options trading (put/call)
+HIGH_VOLATILITY_CATEGORIES = [
+    "result", "quarter", "q1", "q2", "q3", "q4", "earnings", "financial",
+    "order", "contract", "tender", "award", "loi", "mou",
+    "merger", "acquisition", "buyback", "dividend", "bonus", "split",
+    "fund raising", "qip", "fpo", "rights issue",
+    "regulatory", "sebi", "approval", "license",
+    "expansion", "capacity", "project", "commissioning",
+]
+
+
+def _is_high_volatility_category(category: Optional[str], headline: Optional[str]) -> bool:
+    """
+    Check if an announcement category or headline indicates high volatility potential.
+    These are the types that drive put/call options trading.
+    
+    Returns True if the announcement is likely to cause significant price movement
+    (suitable for put/call options trading).
+    """
+    if not category and not headline:
+        return False
+    
+    combined = f"{category or ''} {headline or ''}".lower()
+    
+    # Check if category or headline contains high-volatility keywords
+    for keyword in HIGH_VOLATILITY_CATEGORIES:
+        if keyword.lower() in combined:
+            return True
+    
+    return False
+
+
+# BSE Category values (from the dropdown)
+BSE_CATEGORIES = [
+    "AGM/EGM",
+    "Board Meeting",
+    "Company Update",
+    "Corp. Action",
+    "Insider Trading / SAST",
+    "New Listing",
+    "Result",
+    "Integrated Filing",
+    "Others",
+]
+
+
+def _extract_announcements_from_page(page: Page, category: str) -> List[Dict[str, Any]]:
+    """
+    Extract announcements from the current page state.
+    This is a helper function used after form submission.
+    
+    Args:
+        page: Playwright page object
+        category: Category name for logging
+        
+    Returns:
+        List of announcement dictionaries
+    """
+    announcements = []
+    
+    try:
+        # Try AngularJS scope extraction first
+        js_result = page.evaluate("""
+            () => {
+                var announcements = [];
+                try {
+                    var appElement = document.querySelector('[ng-app]') || document.body;
+                    var scope = angular.element(appElement).scope();
+                    if (scope && scope.CorpannData && scope.CorpannData.Table) {
+                        var table = scope.CorpannData.Table;
+                        for (var i = 0; i < table.length; i++) {
+                            var cann = table[i];
+                            announcements.push({
+                                scrip_code: cann.SCRIP_CD || null,
+                                company_name: cann.SLONGNAME || null,
+                                headline: cann.NEWSSUB || '',
+                                category: cann.CATEGORYNAME || null,
+                                news_date: cann.NEWS_DT || null,
+                                submission_date: cann.News_submission_dt || null,
+                                dissemination_date: cann.DissemDT || null
+                            });
+                        }
+                    }
+                } catch (e) {
+                    console.log('AngularJS scope access failed:', e);
+                }
+                return announcements;
+            }
+        """)
+        
+        if js_result and len(js_result) > 0:
+            logger.info(f"  ✓ Extracted {len(js_result)} announcements from {category} category")
+            return js_result
+        else:
+            logger.debug(f"  No announcements found in AngularJS scope for {category}")
+            return []
+    except Exception as e:
+        logger.debug(f"  AngularJS extraction failed for {category}: {e}")
+        return []
+
+
 def scrape_bse_announcements(
     page: Page,
     target_date: Optional[date] = None,
-    max_pages: int = 10
+    max_pages: int = 10,
+    filter_high_volatility: bool = True
 ) -> List[Dict[str, Any]]:
     """
     Scrape corporate announcements from BSE website.
     
-    The BSE website uses AngularJS to dynamically load announcements.
-    We wait for the AngularJS data to load and extract from the rendered table.
+    NEW APPROACH:
+    1. Navigate to page and set up form (dates, segment)
+    2. Iterate through EACH category (AGM/EGM, Board Meeting, Result, etc.)
+    3. For each category: select it, submit, extract announcements
+    4. Combine all announcements from all categories
+    5. Return combined list (will be prioritized/ranked later before LLM)
+    
+    PREVIOUS APPROACH (what it was doing before):
+    - Navigated to page
+    - Set dates and segment
+    - Left category as default ("--Select Category--" which might show all)
+    - Clicked Submit once
+    - Extracted all announcements from single submission
+    - This assumed leaving category as default would show all categories
     
     Args:
         page: Playwright page object
         target_date: Date to scrape announcements for (defaults to today)
-        max_pages: Maximum number of pages to scrape
+        max_pages: Maximum number of pages to scrape (not used currently)
+        filter_high_volatility: If True, filter by high-volatility keywords (applied after collection)
         
     Returns:
         List of announcement dictionaries with symbol, headline, date, url, etc.
@@ -115,190 +230,329 @@ def scrape_bse_announcements(
         target_date = date.today()
     
     logger.info(f"Scraping BSE announcements for date: {target_date}")
+    logger.info("NEW APPROACH: Iterating through each category to collect all announcements")
     
     base_url = "https://www.bseindia.com/corporates/ann.html"
-    announcements = []
+    all_announcements = []  # Will collect from all categories
     
     try:
         # Navigate to BSE corporate announcements page
+        logger.info(f"Navigating to BSE announcements page: {base_url}")
         page.goto(base_url, wait_until="networkidle", timeout=30000)
+        logger.info("Page loaded, waiting for form elements...")
+        page.wait_for_timeout(2000)
         
-        # Wait for AngularJS to load and render the table
-        page.wait_for_selector("table tbody tr", timeout=15000)
-        page.wait_for_timeout(3000)
+        # Calculate date range
+        from_date = target_date
+        to_date = target_date
+        from_date_str = from_date.strftime("%d/%m/%Y")
+        to_date_str = to_date.strftime("%d/%m/%Y")
         
-        # Try to extract data directly from AngularJS scope using JavaScript
-        # This is more reliable than parsing HTML
+        logger.info(f"Setting date range: From {from_date_str} to {to_date_str}")
+        
+        # Set From Date
         try:
-            js_result = page.evaluate("""
-                () => {
-                    // Try to access AngularJS scope
-                    var announcements = [];
-                    try {
-                        // Get the AngularJS app element
-                        var appElement = document.querySelector('[ng-app]') || document.body;
-                        var scope = angular.element(appElement).scope();
-                        
-                        // Access CorpannData.Table from the scope
-                        if (scope && scope.CorpannData && scope.CorpannData.Table) {
-                            var table = scope.CorpannData.Table;
-                            for (var i = 0; i < table.length; i++) {
-                                var cann = table[i];
-                                announcements.push({
-                                    scrip_code: cann.SCRIP_CD || null,
-                                    company_name: cann.SLONGNAME || null,
-                                    headline: cann.NEWSSUB || '',
-                                    category: cann.CATEGORYNAME || null,
-                                    news_date: cann.NEWS_DT || null,
-                                    submission_date: cann.News_submission_dt || null,
-                                    dissemination_date: cann.DissemDT || null
-                                });
+            page.wait_for_selector("#txtFromDt", timeout=10000)
+            page.fill("#txtFromDt", from_date_str)
+            logger.info(f"✓ Set From Date to: {from_date_str}")
+            page.wait_for_timeout(500)
+            
+            # Close datepicker if it's open (click outside or press Escape)
+            try:
+                # Try to close datepicker by clicking outside or pressing Escape
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(200)
+            except:
+                pass
+        except Exception as e:
+            logger.warning(f"Could not set From Date: {e}")
+        
+        # Set To Date
+        try:
+            page.wait_for_selector("#txtToDt", timeout=10000)
+            page.fill("#txtToDt", to_date_str)
+            logger.info(f"✓ Set To Date to: {to_date_str}")
+            page.wait_for_timeout(500)
+            
+            # Close datepicker if it's open
+            try:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(200)
+            except:
+                pass
+        except Exception as e:
+            logger.warning(f"Could not set To Date: {e}")
+        
+        def _select_equity_fno_segment():
+            """Helper function to select Equity F&O segment - call before each category submission."""
+            try:
+                page.wait_for_selector("#ddlAnnType", timeout=10000)
+                page.select_option("#ddlAnnType", value="EQFO")
+                logger.debug("  ✓ Re-selected 'Equity F&O' segment (value: EQFO)")
+                page.wait_for_timeout(500)
+                return True
+            except Exception as e:
+                logger.debug(f"  Could not select 'Equity F&O' segment via select_option: {e}")
+                # Try JavaScript fallback
+                try:
+                    page.evaluate("""
+                        () => {
+                            var select = document.querySelector('#ddlAnnType');
+                            if (select) {
+                                select.value = 'EQFO';
+                                var event = new Event('change', { bubbles: true });
+                                select.dispatchEvent(event);
                             }
                         }
-                    } catch (e) {
-                        console.log('AngularJS scope access failed:', e);
-                    }
-                    return announcements;
-                }
-            """)
-            
-            if js_result and len(js_result) > 0:
-                logger.info(f"Extracted {len(js_result)} announcements from AngularJS scope")
-                for ann_data in js_result:
-                    try:
-                        headline = ann_data.get("headline", "").strip()
-                        if not headline or len(headline) < 10:
-                            continue
-                        
-                        scrip_code = ann_data.get("scrip_code")
-                        company_name = ann_data.get("company_name")
-                        category = ann_data.get("category")
-                        
-                        # Parse date
-                        event_date = target_date
-                        news_date = ann_data.get("news_date")
-                        if news_date:
-                            # news_date might be in various formats
-                            if isinstance(news_date, str):
-                                parsed = _parse_date(news_date)
-                                if parsed:
-                                    event_date = parsed
-                            elif isinstance(news_date, (int, float)):
-                                # Might be a timestamp
-                                try:
-                                    event_date = datetime.fromtimestamp(news_date / 1000).date()
-                                except:
-                                    pass
-                        
-                        # Extract symbol from company name or headline
-                        symbol = None
-                        if company_name:
-                            words = company_name.split()
-                            if words:
-                                potential_symbol = words[0].upper().strip('.,')
-                                if 2 <= len(potential_symbol) <= 20 and potential_symbol.isalnum():
-                                    symbol = potential_symbol
-                        
-                        if not symbol:
-                            symbol = _extract_symbol_from_text(headline)
-                        
-                        if headline and (symbol or scrip_code):
-                            announcements.append({
-                                "symbol": symbol.upper() if symbol else None,
-                                "scrip_code": str(scrip_code) if scrip_code else None,
-                                "headline": headline[:500],
-                                "event_date": event_date,
-                                "category": category,
-                                "company_name": company_name,
-                                "url": None,  # URL would need to be constructed from scrip_code if needed
-                            })
-                    except Exception as e:
-                        logger.warning(f"Error processing announcement from JS: {e}")
-                        continue
-        except Exception as e:
-            logger.warning(f"Failed to extract from AngularJS scope, falling back to HTML parsing: {e}")
-            
-            # Fallback to HTML parsing
-            rows = page.query_selector_all("table tbody tr")
-            logger.info(f"Found {len(rows)} table rows (fallback mode)")
-            
-            for idx, row in enumerate(rows):
+                    """)
+                    logger.debug("  ✓ Re-selected 'Equity F&O' segment via JavaScript")
+                    page.wait_for_timeout(500)
+                    return True
+                except Exception as js_error:
+                    logger.warning(f"  JavaScript fallback also failed: {js_error}")
+                    return False
+        
+        # Select "Equity F&O" segment initially
+        _select_equity_fno_segment()
+        logger.info("✓ Selected 'Equity F&O' segment (value: EQFO)")
+        
+        # Now iterate through EACH category
+        logger.info(f"Iterating through {len(BSE_CATEGORIES)} categories...")
+        category_selector = "#ddlPeriod"
+        
+        for category_idx, category_value in enumerate(BSE_CATEGORIES, 1):
+            try:
+                logger.info(f"[{category_idx}/{len(BSE_CATEGORIES)}] Processing category: {category_value}")
+                
+                # CRITICAL: Re-select segment before each category to ensure it persists
+                # The form might reset the segment when submitting, so we need to set it again
+                _select_equity_fno_segment()
+                
+                # Select the category
                 try:
-                    # Extract headline
-                    headline_elem = row.query_selector('span[ng-bind-html="cann.NEWSSUB"]')
-                    if not headline_elem:
-                        first_td = row.query_selector("td:first-child")
-                        if first_td:
-                            headline_elem = first_td
-                        else:
-                            continue
-                    
-                    headline = headline_elem.inner_text().strip()
-                    if not headline or len(headline) < 10:
-                        continue
-                    
-                    # Extract from row text
-                    row_text = row.inner_text()
-                    scrip_code = None
-                    scrip_match = re.search(r'Security Code\s*:\s*(\d+)', row_text, re.IGNORECASE)
-                    if scrip_match:
-                        scrip_code = scrip_match.group(1)
-                    
-                    company_name = None
-                    company_match = re.search(r'Company\s*:\s*([^\n]+)', row_text, re.IGNORECASE)
-                    if company_match:
-                        company_name = company_match.group(1).strip()
-                    
-                    category = None
-                    category_match = re.search(r'(AGM/EGM|Board Meeting|Company Update|Corp\. Action|Result|Others)', row_text)
-                    if category_match:
-                        category = category_match.group(1)
-                    
-                    event_date = target_date
-                    date_match = re.search(r'(\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})', row_text, re.IGNORECASE)
-                    if date_match:
-                        date_str = date_match.group(1)
-                        parsed = _parse_date(date_str)
-                        if parsed:
-                            event_date = parsed
-                    
-                    symbol = None
-                    if company_name:
-                        words = company_name.split()
-                        if words:
-                            potential_symbol = words[0].upper().strip('.,')
-                            if 2 <= len(potential_symbol) <= 20 and potential_symbol.isalnum():
-                                symbol = potential_symbol
-                    
-                    if not symbol:
-                        symbol = _extract_symbol_from_text(headline)
-                    
-                    if headline and (symbol or scrip_code):
-                        announcements.append({
-                            "symbol": symbol.upper() if symbol else None,
-                            "scrip_code": scrip_code,
-                            "headline": headline[:500],
-                            "event_date": event_date,
-                            "category": category,
-                            "company_name": company_name,
-                            "url": None,
-                        })
+                    page.wait_for_selector(category_selector, timeout=10000)
+                    page.select_option(category_selector, label=category_value)
+                    logger.info(f"  ✓ Selected category: {category_value}")
+                    page.wait_for_timeout(1000)  # Wait for AngularJS to update
                 except Exception as e:
-                    logger.warning(f"Error parsing row {idx}: {e}")
+                    logger.warning(f"  Could not select category {category_value}: {e}")
                     continue
+                
+                # Click Submit button
+                # The datepicker overlay is blocking clicks, so we need to:
+                # 1. Close/hide the datepicker
+                # 2. Use JavaScript to trigger submit directly (bypasses click blocking)
+                try:
+                    # Strategy 1: Use JavaScript to directly call Angular's fn_submit() function
+                    # This bypasses the datepicker blocking issue entirely
+                    try:
+                        logger.info(f"  Attempting to submit via JavaScript for {category_value}...")
+                        result = page.evaluate("""
+                            () => {
+                                // First, hide/close any open datepickers
+                                var datepickers = document.querySelectorAll('.ui-datepicker, #ui-datepicker-div');
+                                for (var i = 0; i < datepickers.length; i++) {
+                                    datepickers[i].style.display = 'none';
+                                }
+                                
+                                // Get AngularJS scope and call fn_submit()
+                                try {
+                                    var appElement = document.querySelector('[ng-app]') || document.body;
+                                    var scope = angular.element(appElement).scope();
+                                    if (scope && scope.fn_submit) {
+                                        scope.$apply(function() {
+                                            scope.fn_submit();
+                                        });
+                                        return true;
+                                    }
+                                } catch (e) {
+                                    console.log('AngularJS submit failed:', e);
+                                }
+                                return false;
+                            }
+                        """)
+                        if result:
+                            logger.info(f"  ✓ Triggered Submit for {category_value} (via JavaScript)")
+                            submit_clicked = True
+                        else:
+                            logger.debug("  JavaScript submit: Could not find AngularJS scope or fn_submit function")
+                            submit_clicked = False
+                    except Exception as e1:
+                        logger.debug(f"  JavaScript submit failed: {e1}")
+                        submit_clicked = False
+                    
+                    # Strategy 2: If JavaScript didn't work, try clicking with datepicker hidden
+                    if not submit_clicked:
+                        try:
+                            # Hide datepicker first
+                            page.evaluate("""
+                                () => {
+                                    var datepickers = document.querySelectorAll('.ui-datepicker, #ui-datepicker-div');
+                                    for (var i = 0; i < datepickers.length; i++) {
+                                        datepickers[i].style.display = 'none';
+                                    }
+                                }
+                            """)
+                            page.wait_for_timeout(300)
+                            
+                            # Press Escape to ensure datepicker is closed
+                            page.keyboard.press("Escape")
+                            page.wait_for_timeout(300)
+                            
+                            # Use specific selector
+                            submit_selector = 'input[name="submit"][ng-click="fn_submit()"]'
+                            page.wait_for_selector(submit_selector, timeout=5000)
+                            
+                            # Scroll button into view
+                            page.evaluate("""
+                                () => {
+                                    var btn = document.querySelector('input[name="submit"][ng-click="fn_submit()"]');
+                                    if (btn) {
+                                        btn.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                    }
+                                }
+                            """)
+                            page.wait_for_timeout(500)
+                            
+                            # Click with force to bypass actionability
+                            page.click(submit_selector, force=True, timeout=10000)
+                            logger.info(f"  ✓ Clicked Submit for {category_value} (via click with datepicker hidden)")
+                            submit_clicked = True
+                        except Exception as e2:
+                            logger.debug(f"  Click submit failed: {e2}")
+                    
+                    if not submit_clicked:
+                        raise Exception("All submit strategies failed")
+                    
+                    # Wait for results to load
+                    logger.info(f"  Waiting for results to load for {category_value}...")
+                    page.wait_for_timeout(3000)  # Give AngularJS time to process
+                    
+                    # Wait for table to appear (with longer timeout)
+                    try:
+                        page.wait_for_selector("table tbody tr", timeout=15000)
+                        logger.info(f"  ✓ Results loaded for {category_value}")
+                    except:
+                        logger.warning(f"  Results table not found for {category_value}, but continuing...")
+                        
+                except Exception as e:
+                    logger.warning(f"  Could not submit or load results for {category_value}: {e}")
+                    continue
+                
+                # Extract announcements from this category
+                category_announcements = _extract_announcements_from_page(page, category_value)
+                
+                if category_announcements:
+                    # Process and add to all_announcements
+                    for ann_data in category_announcements:
+                        try:
+                            headline = ann_data.get("headline", "").strip()
+                            if not headline or len(headline) < 10:
+                                continue
+                            
+                            scrip_code = ann_data.get("scrip_code")
+                            company_name = ann_data.get("company_name")
+                            category = ann_data.get("category") or category_value
+                            
+                            # Parse date
+                            event_date = target_date
+                            news_date = ann_data.get("news_date")
+                            if news_date:
+                                if isinstance(news_date, str):
+                                    parsed = _parse_date(news_date)
+                                    if parsed:
+                                        event_date = parsed
+                                elif isinstance(news_date, (int, float)):
+                                    try:
+                                        event_date = datetime.fromtimestamp(news_date / 1000).date()
+                                    except:
+                                        pass
+                            
+                            # Extract symbol
+                            symbol = None
+                            if company_name:
+                                words = company_name.split()
+                                if words:
+                                    potential_symbol = words[0].upper().strip('.,')
+                                    if 2 <= len(potential_symbol) <= 20 and potential_symbol.isalnum():
+                                        symbol = potential_symbol
+                            
+                            if not symbol:
+                                symbol = _extract_symbol_from_text(headline)
+                            
+                            if headline and (symbol or scrip_code):
+                                ann_dict = {
+                                    "symbol": symbol.upper() if symbol else None,
+                                    "scrip_code": str(scrip_code) if scrip_code else None,
+                                    "headline": headline[:500],
+                                    "event_date": event_date,
+                                    "category": category,
+                                    "company_name": company_name,
+                                    "url": None,
+                                }
+                                all_announcements.append(ann_dict)
+                        except Exception as e:
+                            logger.warning(f"  Error processing announcement from {category_value}: {e}")
+                            continue
+                
+                # Small delay between categories to avoid rate limiting
+                page.wait_for_timeout(1000)
+                
+            except Exception as e:
+                logger.warning(f"Error processing category {category_value}: {e}")
+                continue
         
-        # Handle pagination if needed
-        # BSE has "Prev" and "Next" buttons
-        # For now, we'll just get the first page
-        # TODO: Add pagination support if needed
+        logger.info(f"✓ Collected {len(all_announcements)} total announcements from all categories")
         
-        logger.info(f"Scraped {len(announcements)} announcements from BSE")
+        # Now filter for high-volatility if requested (this happens AFTER collecting from all categories)
+        announcements = []
+        filtered_count = 0
+        
+        if filter_high_volatility:
+            logger.info(f"Filtering {len(all_announcements)} announcements for high-volatility categories...")
+            for ann in all_announcements:
+                category = ann.get("category", "")
+                headline = ann.get("headline", "")
+                if _is_high_volatility_category(category, headline):
+                    announcements.append(ann)
+                else:
+                    filtered_count += 1
+            logger.info(
+                f"✓ Filtered to {len(announcements)} high-volatility announcements "
+                f"(filtered out {filtered_count} low-volatility)"
+            )
+        else:
+            announcements = all_announcements
+        
+        # Summary logging
+        if filter_high_volatility:
+            if filtered_count > 0:
+                logger.info(
+                    f"✓ Final result: {len(announcements)} high-volatility announcements "
+                    f"(from {len(all_announcements)} total, filtered out {filtered_count})"
+                )
+            else:
+                logger.info(
+                    f"✓ Final result: {len(announcements)} high-volatility announcements "
+                    f"(all {len(all_announcements)} matched high-volatility criteria)"
+                )
+        else:
+            logger.info(f"✓ Final result: {len(announcements)} announcements (no filtering applied)")
+        
+        if len(announcements) == 0:
+            logger.warning(
+                f"No announcements found! This could mean: "
+                f"1) No announcements for the selected date/segment/categories, "
+                f"2) Form submissions didn't work, "
+                f"3) Page structure changed, or "
+                f"4) All announcements were filtered out (if filtering enabled)"
+            )
+        
+        return announcements
         
     except Exception as e:
         logger.error(f"Error scraping BSE announcements: {e}")
         raise
-    
-    return announcements
 
 
 def ingest_bse_announcements(
@@ -350,15 +604,21 @@ def ingest_bse_announcements(
         
         try:
             # Scrape for target date and lookback days
+            # Filter for high-volatility categories (results, orders, etc.) that drive put/call options
             all_announcements = []
             for days_back in range(lookback_days + 1):
                 scrape_date = target_date - timedelta(days=days_back)
-                announcements = scrape_bse_announcements(page, target_date=scrape_date)
+                announcements = scrape_bse_announcements(
+                    page, 
+                    target_date=scrape_date,
+                    filter_high_volatility=True  # Only get high-volatility announcements
+                )
                 all_announcements.extend(announcements)
             
             # Prepare announcements and generate hashes
-            announcements_to_insert = []
-            content_hashes = []
+            # Use a dict to deduplicate by content_hash within the scraped announcements
+            # (same announcement might appear in multiple categories)
+            announcements_dict = {}  # content_hash -> event
             
             for ann in all_announcements:
                 symbol = ann.get("symbol")
@@ -378,9 +638,13 @@ def ingest_bse_announcements(
                 
                 # Generate content hash for deduplication
                 content_hash = _generate_content_hash(identifier, headline, event_date)
-                content_hashes.append(content_hash)
                 
-                # Create event record (will be inserted if not duplicate)
+                # Deduplicate: if we've seen this hash before, skip it (same announcement in multiple categories)
+                if content_hash in announcements_dict:
+                    logger.debug(f"Skipping duplicate announcement within scraped results: {headline[:50]}...")
+                    continue
+                
+                # Create event record (will be inserted if not duplicate in DB)
                 event = BSEEvent(
                     symbol=symbol,
                     scrip_code=ann.get("scrip_code"),
@@ -393,13 +657,16 @@ def ingest_bse_announcements(
                     content_hash=content_hash,
                 )
                 
-                announcements_to_insert.append((content_hash, event))
+                announcements_dict[content_hash] = event
             
-            if not announcements_to_insert:
+            if not announcements_dict:
                 logger.info("No valid announcements to insert")
                 return 0
             
-            # Check which content_hashes already exist (bulk check)
+            # Extract content_hashes for database check
+            content_hashes = list(announcements_dict.keys())
+            
+            # Check which content_hashes already exist in database (bulk check)
             existing_hashes = set(
                 db.query(BSEEvent.content_hash)
                 .filter(BSEEvent.content_hash.in_(content_hashes))
@@ -408,14 +675,14 @@ def ingest_bse_announcements(
             # Flatten the result set
             existing_hashes = {h[0] for h in existing_hashes}
             
-            # Filter out duplicates
+            # Filter out duplicates that already exist in database
             new_announcements = [
-                event for content_hash, event in announcements_to_insert
+                event for content_hash, event in announcements_dict.items()
                 if content_hash not in existing_hashes
             ]
             
             if not new_announcements:
-                logger.info(f"All {len(announcements_to_insert)} announcements already exist in database")
+                logger.info(f"All {len(announcements_dict)} announcements already exist in database")
                 return 0
             
             # Insert new announcements in batches with error handling
@@ -456,7 +723,8 @@ def ingest_bse_announcements(
                                 logger.warning(f"Error inserting announcement: {individual_error}")
             
             if inserted > 0:
-                logger.info(f"Inserted {inserted} new BSE announcements (skipped {len(announcements_to_insert) - inserted} duplicates)")
+                skipped_count = len(announcements_dict) - inserted
+                logger.info(f"Inserted {inserted} new BSE announcements (skipped {skipped_count} duplicates)")
             else:
                 logger.info("No new BSE announcements to insert")
                 
